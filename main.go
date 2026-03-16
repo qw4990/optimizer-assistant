@@ -27,7 +27,7 @@ func main() {
 		log.Fatalf("init query agent failed: %v", err)
 	}
 
-	// 注册事件回调。OnP2MessageReceiveV1 为接收消息事件 v2.0。
+	// Register event handlers. OnP2MessageReceiveV1 handles message receive event v2.0.
 	eventHandler := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 			fmt.Printf("[ OnP2MessageReceiveV1 access ], data: %s\n", larkcore.Prettify(event))
@@ -40,13 +40,13 @@ func main() {
 
 			question := extractQuestion(event)
 			if question == "" {
-				question = "请介绍你的能力"
+				question = "Please introduce your capabilities."
 			}
 
 			answer, err := agent.Answer(ctx, question)
 			if err != nil {
 				log.Printf("agent answer failed, message_id=%s, err=%v", messageID, err)
-				answer = "抱歉，我暂时无法回答这个问题，请稍后重试。"
+				answer = "Agent Error: " + err.Error()
 			}
 
 			content, err := buildTextContent(answer)
@@ -72,12 +72,12 @@ func main() {
 
 			return nil
 		})
-	// 创建长连接客户端
+	// Create a websocket client.
 	cli := larkws.NewClient(appID, appSecret,
 		larkws.WithEventHandler(eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelDebug),
 	)
-	// 启动客户端并保持长连接
+	// Start client and keep websocket connection alive.
 	err = cli.Start(context.Background())
 	if err != nil {
 		panic(err)
