@@ -43,17 +43,19 @@ func main() {
 				question = "Please introduce your capabilities."
 			}
 
-			content, err := agent.Answer(ctx, question)
+			answer, err := agent.Answer(ctx, question)
 			if err != nil {
 				log.Printf("agent answer failed, message_id=%s, err=%v", messageID, err)
-				content, err = buildFeishuPostContentFromText(err.Error(), "Agent Error")
-				if err != nil {
-					return fmt.Errorf("build error reply content failed: %w", err)
-				}
+				answer = "Agent Error: " + err.Error()
 			}
 
-			if err := replyPostMessage(ctx, apiClient, messageID, content); err != nil {
-				return err
+			content, err := buildTextContent(answer)
+			if err != nil {
+				return fmt.Errorf("build text reply content failed: %w", err)
+			}
+
+			if err := replyTextMessage(ctx, apiClient, messageID, content); err != nil {
+				return fmt.Errorf("reply text message failed: %w", err)
 			}
 
 			return nil
@@ -114,65 +116,33 @@ func extractQuestion(event *larkim.P2MessageReceiveV1) string {
 	return raw
 }
 
-func replyPostMessage(ctx context.Context, apiClient *lark.Client, messageID, content string) error {
-	candidates := []string{content}
-	if alternative, ok := togglePostContentWrapper(content); ok && alternative != content {
-		candidates = append(candidates, alternative)
+func buildTextContent(text string) (string, error) {
+	payload := map[string]string{
+		"text": strings.TrimSpace(text),
 	}
-
-	var lastErr error
-	for i, candidate := range candidates {
-		resp, err := apiClient.Im.V1.Message.Reply(ctx,
-			larkim.NewReplyMessageReqBuilder().
-				MessageId(messageID).
-				Body(larkim.NewReplyMessageReqBodyBuilder().
-					MsgType("post").
-					Content(candidate).
-					Uuid("reply-"+messageID).
-					Build()).
-				Build())
-		if err != nil {
-			lastErr = fmt.Errorf("call reply api failed: %w", err)
-			continue
-		}
-		if resp.Success() {
-			if i > 0 {
-				log.Printf("reply succeeded after switching post content wrapper format, message_id=%s", messageID)
-			}
-			return nil
-		}
-		lastErr = fmt.Errorf("reply api failed, code=%d, msg=%s", resp.Code, resp.Msg)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
 	}
-	return lastErr
+	return string(b), nil
 }
 
-func togglePostContentWrapper(content string) (string, bool) {
-	raw := strings.TrimSpace(content)
-	if raw == "" {
-		return "", false
-	}
-
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		return "", false
-	}
-
-	if postRaw, ok := obj["post"]; ok {
-		return string(postRaw), true
-	}
-
-	_, hasZhCN := obj["zh_cn"]
-	_, hasEnUS := obj["en_us"]
-	_, hasJaJP := obj["ja_jp"]
-	if !hasZhCN && !hasEnUS && !hasJaJP {
-		return "", false
-	}
-
-	wrapped, err := json.Marshal(map[string]json.RawMessage{
-		"post": json.RawMessage(raw),
-	})
+func replyTextMessage(ctx context.Context, apiClient *lark.Client, messageID, content string) error {
+	log.Printf("replying text to message_id=%s, content=%s", messageID, content)
+	resp, err := apiClient.Im.V1.Message.Reply(ctx,
+		larkim.NewReplyMessageReqBuilder().
+			MessageId(messageID).
+			Body(larkim.NewReplyMessageReqBodyBuilder().
+				MsgType("text").
+				Content(content).
+				Uuid("reply-"+messageID).
+				Build()).
+			Build())
 	if err != nil {
-		return "", false
+		return fmt.Errorf("call reply api failed: %w", err)
 	}
-	return string(wrapped), true
+	if !resp.Success() {
+		return fmt.Errorf("reply api failed, code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
 }

@@ -118,11 +118,11 @@ func (a *QueryAgent) Answer(ctx context.Context, question string) (string, error
 	if answer == "" {
 		return "", fmt.Errorf("empty assistant content from chat completion")
 	}
-	postContent, err := normalizeFeishuPostContent(answer)
-	if err != nil {
-		return "", fmt.Errorf("invalid Feishu post content from agent: %w", err)
+	answer = normalizePlainTextAnswer(answer)
+	if answer == "" {
+		return "", fmt.Errorf("empty assistant answer after normalization")
 	}
-	return postContent, nil
+	return answer, nil
 }
 
 func loadSkillMarkdown(ctx context.Context, skillURL string) (string, error) {
@@ -182,29 +182,9 @@ Requirements:
 1. Prioritize actionable recommendations (SQL, indexes, statistics, and execution-plan analysis steps).
 2. If information is insufficient, explicitly list the missing details and provide the smallest next diagnostic steps.
 3. Do not invent TiDB syntax, features, or configuration options that do not exist.
-4. Return the final answer as Feishu rich text content JSON for msg_type="post", not Markdown.
-5. The output must be valid JSON only (no prose outside JSON, no code fences).
-6. Return JSON in one of the following compatible content schemas:
-   {
-     "zh_cn": {
-       "title": "short title",
-       "content": [
-         [{"tag":"text","text":"line 1"}],
-         [{"tag":"text","text":"line 2"}]
-       ]
-     }
-   }
-   Or:
-   {
-     "post": { ...same locale structure... }
-   }
-   Or:
-   {
-     "msg_type": "post",
-     "content": { ...same locale structure or wrapped post object... }
-   }
-7. Always provide both "zh_cn" and "en_us" locales with equivalent content.
-8. Default to concise, structured, and practical content in English.
+4. Output plain text only. Do not use JSON or rich-text syntax.
+5. Provide complete and accurate answers with enough detail to be useful.
+6. Default language is English.
 
 The following SKILL.md is mandatory guidance:
 <skill_md>
@@ -236,6 +216,15 @@ func parseCompletionContent(raw json.RawMessage) string {
 	}
 
 	return ""
+}
+
+func normalizePlainTextAnswer(raw string) string {
+	s := strings.TrimSpace(stripCodeFence(raw))
+	if s == "" {
+		return ""
+	}
+
+	return s
 }
 
 func normalizeFeishuPostContent(raw string) (string, error) {
