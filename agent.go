@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	defaultOpenAIBaseURL = "https://api.openai.com"
-	defaultOpenAIModel   = "gpt-4.1-mini"
+	defaultKimiBaseURL = "https://api.moonshot.cn"
+	defaultKimiModel   = "moonshot-v1-8k"
 )
 
 type QueryAgent struct {
@@ -26,13 +26,13 @@ type QueryAgent struct {
 }
 
 func NewQueryAgent(ctx context.Context, skillURL string) (*QueryAgent, error) {
-	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	apiKey := strings.TrimSpace(os.Getenv("KIMI_API_KEY"))
 	if apiKey == "" {
-		return nil, fmt.Errorf("OPENAI_API_KEY is required")
+		return nil, fmt.Errorf("KIMI_API_KEY is required")
 	}
 
-	model := getEnvOrDefault("OPENAI_MODEL", defaultOpenAIModel)
-	baseURL := getEnvOrDefault("OPENAI_BASE_URL", defaultOpenAIBaseURL)
+	model := getEnvOrDefault("KIMI_MODEL", defaultKimiModel)
+	baseURL := getEnvOrDefault("KIMI_BASE_URL", defaultKimiBaseURL)
 
 	skill, err := loadSkillMarkdown(ctx, skillURL)
 	if err != nil {
@@ -43,11 +43,19 @@ func NewQueryAgent(ctx context.Context, skillURL string) (*QueryAgent, error) {
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
-		endpoint:     strings.TrimRight(baseURL, "/") + "/v1/chat/completions",
+		endpoint:     buildKimiEndpoint(baseURL),
 		apiKey:       apiKey,
 		model:        model,
 		systemPrompt: buildSystemPrompt(skill),
 	}, nil
+}
+
+func buildKimiEndpoint(baseURL string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(base, "/v1") {
+		return base + "/chat/completions"
+	}
+	return base + "/v1/chat/completions"
 }
 
 func (a *QueryAgent) Answer(ctx context.Context, question string) (string, error) {
