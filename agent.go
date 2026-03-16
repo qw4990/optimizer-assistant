@@ -5,9 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"log"
 	"net/http"
+	urlpkg "net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,14 +20,20 @@ import (
 const (
 	defaultKimiBaseURL = "https://api.moonshot.cn"
 	defaultKimiModel   = "moonshot-v1-8k"
+	defaultToolMaxStep = 8
+	defaultFetchTO     = 20
+	maxFetchBodyBytes  = 2 << 20
+	maxToolResultChars = 12000
 )
 
 type QueryAgent struct {
-	httpClient   *http.Client
-	endpoint     string
-	apiKey       string
-	model        string
-	systemPrompt string
+	httpClient       *http.Client
+	endpoint         string
+	apiKey           string
+	model            string
+	systemPrompt     string
+	maxToolLoopSteps int
+	fetchTimeout     time.Duration
 }
 
 func NewQueryAgent(ctx context.Context, skillURL string) (*QueryAgent, error) {
@@ -33,6 +44,8 @@ func NewQueryAgent(ctx context.Context, skillURL string) (*QueryAgent, error) {
 
 	model := getEnvOrDefault("KIMI_MODEL", defaultKimiModel)
 	baseURL := getEnvOrDefault("KIMI_BASE_URL", defaultKimiBaseURL)
+	maxToolLoopSteps := getEnvAsInt("AGENT_MAX_TOOL_STEPS", defaultToolMaxStep)
+	fetchTimeoutSec := getEnvAsInt("AGENT_FETCH_TIMEOUT_SECONDS", defaultFetchTO)
 
 	skill, err := loadSkillMarkdown(ctx, skillURL)
 	if err != nil {
@@ -43,10 +56,12 @@ func NewQueryAgent(ctx context.Context, skillURL string) (*QueryAgent, error) {
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
-		endpoint:     buildKimiEndpoint(baseURL),
-		apiKey:       apiKey,
-		model:        model,
-		systemPrompt: buildSystemPrompt(skill),
+		endpoint:         buildKimiEndpoint(baseURL),
+		apiKey:           apiKey,
+		model:            model,
+		systemPrompt:     buildSystemPrompt(skill),
+		maxToolLoopSteps: maxToolLoopSteps,
+		fetchTimeout:     time.Duration(fetchTimeoutSec) * time.Second,
 	}, nil
 }
 
@@ -59,70 +74,7 @@ func buildKimiEndpoint(baseURL string) string {
 }
 
 func (a *QueryAgent) Answer(ctx context.Context, question string) (string, error) {
-	reqBody := chatCompletionReq{
-		Model: a.model,
-		Messages: []chatCompletionMessage{
-			{
-				Role:    "system",
-				Content: a.systemPrompt,
-			},
-			{
-				Role:    "user",
-				Content: question,
-			},
-		},
-		Temperature: 0.2,
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal chat completion request failed: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", fmt.Errorf("build chat completion request failed: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+a.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("call chat completion failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return "", fmt.Errorf("read chat completion response failed: %w", err)
-	}
-
-	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("chat completion failed, status=%d, body=%s", resp.StatusCode, string(respBody))
-	}
-
-	var completionResp chatCompletionResp
-	if err := json.Unmarshal(respBody, &completionResp); err != nil {
-		return "", fmt.Errorf("unmarshal chat completion response failed: %w, body=%s", err, string(respBody))
-	}
-
-	if completionResp.Error != nil {
-		return "", fmt.Errorf("chat completion API error: %s", completionResp.Error.Message)
-	}
-	if len(completionResp.Choices) == 0 {
-		return "", fmt.Errorf("empty choices from chat completion")
-	}
-
-	answer := parseCompletionContent(completionResp.Choices[0].Message.Content)
-	if answer == "" {
-		return "", fmt.Errorf("empty assistant content from chat completion")
-	}
-	answer = normalizePlainTextAnswer(answer)
-	if answer == "" {
-		return "", fmt.Errorf("empty assistant answer after normalization")
-	}
-	return answer, nil
+	return a.runToolLoop(ctx, question)
 }
 
 func loadSkillMarkdown(ctx context.Context, skillURL string) (string, error) {
@@ -182,9 +134,10 @@ Requirements:
 1. Prioritize actionable recommendations (SQL, indexes, statistics, and execution-plan analysis steps).
 2. If information is insufficient, explicitly list the missing details and provide the smallest next diagnostic steps.
 3. Do not invent TiDB syntax, features, or configuration options that do not exist.
-4. Output plain text only. Do not use JSON or rich-text syntax.
-5. Provide complete and accurate answers with enough detail to be useful.
-6. Default language is English.
+4. You can call tool "fetch_url" whenever you need webpage data before answering.
+5. Output the final answer as plain text only. Do not use JSON or rich-text syntax.
+6. Provide complete and accurate answers with enough detail to be useful.
+7. Default language is English.
 
 The following SKILL.md is mandatory guidance:
 <skill_md>
@@ -223,86 +176,7 @@ func normalizePlainTextAnswer(raw string) string {
 	if s == "" {
 		return ""
 	}
-
 	return s
-}
-
-func normalizeFeishuPostContent(raw string) (string, error) {
-	cleaned := stripCodeFence(raw)
-	if cleaned == "" {
-		return buildFeishuPostContentFromText("No content returned by agent.", "TiDB Query Tuning")
-	}
-
-	// Support full message envelope format:
-	// {"msg_type":"post","content":{...}}
-	// {"msg_type":"post","content":"{...}"}
-	var envelope struct {
-		Content json.RawMessage `json:"content"`
-	}
-	if err := json.Unmarshal([]byte(cleaned), &envelope); err == nil && len(envelope.Content) > 0 {
-		var contentString string
-		if err := json.Unmarshal(envelope.Content, &contentString); err == nil {
-			cleaned = strings.TrimSpace(contentString)
-		} else {
-			cleaned = strings.TrimSpace(string(envelope.Content))
-		}
-	}
-
-	var postContent feishuPostContent
-	if err := json.Unmarshal([]byte(cleaned), &postContent); err == nil && postContent.hasLocale() {
-		return marshalFeishuPostContent(postContent)
-	}
-
-	var wrapped struct {
-		Post feishuPostContent `json:"post"`
-	}
-	if err := json.Unmarshal([]byte(cleaned), &wrapped); err == nil && wrapped.Post.hasLocale() {
-		return marshalFeishuPostContent(wrapped.Post)
-	}
-
-	// If model does not follow JSON format strictly, degrade gracefully.
-	return buildFeishuPostContentFromText(cleaned, "TiDB Query Tuning")
-}
-
-func buildFeishuPostContentFromText(text, title string) (string, error) {
-	plain := strings.TrimSpace(stripCodeFence(text))
-	if plain == "" {
-		plain = "No content."
-	}
-
-	lines := strings.Split(plain, "\n")
-	content := make([][]feishuPostTag, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		content = append(content, []feishuPostTag{{Tag: "text", Text: line}})
-	}
-	if len(content) == 0 {
-		content = append(content, []feishuPostTag{{Tag: "text", Text: plain}})
-	}
-
-	postContent := feishuPostContent{
-		ZhCN: &feishuPostLocale{
-			Title:   strings.TrimSpace(title),
-			Content: content,
-		},
-		EnUS: &feishuPostLocale{
-			Title:   strings.TrimSpace(title),
-			Content: content,
-		},
-	}
-	return marshalFeishuPostContent(postContent)
-}
-
-func marshalFeishuPostContent(postContent feishuPostContent) (string, error) {
-	postContent.applyDefaults()
-	b, err := json.Marshal(postContent)
-	if err != nil {
-		return "", fmt.Errorf("marshal Feishu post content failed: %w", err)
-	}
-	return string(b), nil
 }
 
 func stripCodeFence(raw string) string {
@@ -323,101 +197,285 @@ func stripCodeFence(raw string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-type feishuPostContent struct {
-	ZhCN *feishuPostLocale `json:"zh_cn,omitempty"`
-	EnUS *feishuPostLocale `json:"en_us,omitempty"`
-}
+func (a *QueryAgent) runToolLoop(ctx context.Context, question string) (string, error) {
+	log.Printf("agent_tool_loop_start max_steps=%d question=%q", a.maxToolLoopSteps, summarizeForLog(question, 300))
 
-type feishuPostLocale struct {
-	Title   string            `json:"title"`
-	Content [][]feishuPostTag `json:"content"`
-}
-
-type feishuPostTag struct {
-	Tag      string   `json:"tag"`
-	Text     string   `json:"text,omitempty"`
-	Href     string   `json:"href,omitempty"`
-	UserID   string   `json:"user_id,omitempty"`
-	UserName string   `json:"user_name,omitempty"`
-	Style    []string `json:"style,omitempty"`
-}
-
-func (p feishuPostContent) hasLocale() bool {
-	return p.ZhCN != nil || p.EnUS != nil
-}
-
-func (p *feishuPostContent) applyDefaults() {
-	// Keep both locales to maximize rendering compatibility across Feishu client languages.
-	if p.ZhCN == nil && p.EnUS != nil {
-		p.ZhCN = cloneLocale(p.EnUS)
-	}
-	if p.EnUS == nil && p.ZhCN != nil {
-		p.EnUS = cloneLocale(p.ZhCN)
+	messages := []chatCompletionMessage{
+		{
+			Role:    "system",
+			Content: a.systemPrompt,
+		},
+		{
+			Role:    "user",
+			Content: question,
+		},
 	}
 
-	if p.ZhCN != nil {
-		applyLocaleDefaults(p.ZhCN, "TiDB Query Tuning")
-	}
-	if p.EnUS != nil {
-		applyLocaleDefaults(p.EnUS, "TiDB Query Tuning")
-	}
-	if p.ZhCN == nil && p.EnUS == nil {
-		p.ZhCN = &feishuPostLocale{
-			Title:   "TiDB Query Tuning",
-			Content: [][]feishuPostTag{{{Tag: "text", Text: "No content."}}},
+	for step := 0; step < a.maxToolLoopSteps; step++ {
+		log.Printf("agent_tool_loop_step step=%d message_count=%d", step+1, len(messages))
+
+		resp, err := a.requestChatCompletion(ctx, messages)
+		if err != nil {
+			log.Printf("agent_tool_loop_request_error step=%d err=%v", step+1, err)
+			return "", err
+		}
+		if len(resp.Choices) == 0 {
+			return "", fmt.Errorf("empty choices from chat completion")
+		}
+
+		msg := resp.Choices[0].Message
+		if len(msg.ToolCalls) == 0 {
+			answer := normalizePlainTextAnswer(parseCompletionContent(msg.Content))
+			if answer == "" {
+				return "", fmt.Errorf("empty assistant answer")
+			}
+			log.Printf("agent_tool_loop_finish step=%d answer_len=%d answer=%q", step+1, len(answer), summarizeForLog(answer, 500))
+			return answer, nil
+		}
+
+		assistantContent := parseCompletionContent(msg.Content)
+		log.Printf("agent_tool_calls_detected step=%d count=%d assistant_content=%q", step+1, len(msg.ToolCalls), summarizeForLog(assistantContent, 300))
+		messages = append(messages, chatCompletionMessage{
+			Role:      "assistant",
+			Content:   assistantContent,
+			ToolCalls: msg.ToolCalls,
+		})
+
+		for _, call := range msg.ToolCalls {
+			log.Printf("agent_tool_call_start step=%d tool_call_id=%s tool=%s args=%q", step+1, call.ID, call.Function.Name, summarizeForLog(call.Function.Arguments, 500))
+
+			result, toolErr := a.executeToolCall(ctx, call)
+			if toolErr != nil {
+				log.Printf("agent_tool_call_error step=%d tool_call_id=%s tool=%s err=%v", step+1, call.ID, call.Function.Name, toolErr)
+				result = "TOOL_ERROR: " + toolErr.Error()
+			} else {
+				log.Printf("agent_tool_call_success step=%d tool_call_id=%s tool=%s result=%q", step+1, call.ID, call.Function.Name, summarizeForLog(result, 500))
+			}
+			messages = append(messages, chatCompletionMessage{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Content:    result,
+			})
 		}
 	}
+	log.Printf("agent_tool_loop_max_steps_exceeded max_steps=%d", a.maxToolLoopSteps)
+	return "", fmt.Errorf("agent exceeded max tool loop steps (%d)", a.maxToolLoopSteps)
 }
 
-func cloneLocale(src *feishuPostLocale) *feishuPostLocale {
-	if src == nil {
-		return nil
+func (a *QueryAgent) requestChatCompletion(ctx context.Context, messages []chatCompletionMessage) (*chatCompletionResp, error) {
+	reqBody := chatCompletionReq{
+		Model:       a.model,
+		Messages:    messages,
+		Temperature: 0.2,
+		Tools:       buildToolDefinitions(),
 	}
 
-	dst := &feishuPostLocale{
-		Title:   src.Title,
-		Content: make([][]feishuPostTag, 0, len(src.Content)),
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal chat completion request failed: %w", err)
 	}
-	for _, paragraph := range src.Content {
-		clonedParagraph := make([]feishuPostTag, len(paragraph))
-		copy(clonedParagraph, paragraph)
-		dst.Content = append(dst.Content, clonedParagraph)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("build chat completion request failed: %w", err)
 	}
-	return dst
+	req.Header.Set("Authorization", "Bearer "+a.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call chat completion failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read chat completion response failed: %w", err)
+	}
+
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("chat completion failed, status=%d, body=%s", resp.StatusCode, string(respBody))
+	}
+
+	var completionResp chatCompletionResp
+	if err := json.Unmarshal(respBody, &completionResp); err != nil {
+		return nil, fmt.Errorf("unmarshal chat completion response failed: %w, body=%s", err, string(respBody))
+	}
+	if completionResp.Error != nil {
+		return nil, fmt.Errorf("chat completion API error: %s", completionResp.Error.Message)
+	}
+	return &completionResp, nil
 }
 
-func applyLocaleDefaults(locale *feishuPostLocale, defaultTitle string) {
-	if strings.TrimSpace(locale.Title) == "" {
-		locale.Title = defaultTitle
+func buildToolDefinitions() []chatTool {
+	return []chatTool{
+		{
+			Type: "function",
+			Function: chatToolFunction{
+				Name:        "fetch_url",
+				Description: "Fetch webpage content from a URL and return cleaned plain text.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"url": map[string]string{
+							"type":        "string",
+							"description": "Target webpage URL, must start with http:// or https://",
+						},
+					},
+					"required": []string{"url"},
+				},
+			},
+		},
+	}
+}
+
+func (a *QueryAgent) executeToolCall(ctx context.Context, call chatCompletionToolCall) (string, error) {
+	if call.Type != "function" {
+		return "", fmt.Errorf("unsupported tool call type: %s", call.Type)
 	}
 
-	if len(locale.Content) == 0 {
-		locale.Content = [][]feishuPostTag{{{Tag: "text", Text: "No content."}}}
-		return
+	switch call.Function.Name {
+	case "fetch_url":
+		var args struct {
+			URL string `json:"url"`
+		}
+		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid fetch_url args: %w", err)
+		}
+		if strings.TrimSpace(args.URL) == "" {
+			return "", fmt.Errorf("fetch_url requires non-empty url")
+		}
+		return a.fetchURLTool(ctx, args.URL)
+	default:
+		return "", fmt.Errorf("unsupported tool name: %s", call.Function.Name)
+	}
+}
+
+func (a *QueryAgent) fetchURLTool(ctx context.Context, rawURL string) (string, error) {
+	u, err := urlpkg.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", fmt.Errorf("invalid url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported url scheme: %s", u.Scheme)
 	}
 
-	normalized := make([][]feishuPostTag, 0, len(locale.Content))
-	for _, paragraph := range locale.Content {
-		if len(paragraph) == 0 {
+	toolCtx, cancel := context.WithTimeout(ctx, a.fetchTimeout)
+	defer cancel()
+
+	log.Printf("tool_fetch_url_start url=%s timeout=%s", u.String(), a.fetchTimeout)
+
+	req, err := http.NewRequestWithContext(toolCtx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("build fetch request failed: %w", err)
+	}
+	req.Header.Set("User-Agent", "optimizer-assistant-tool/1.0")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain,application/json,*/*")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch url failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("read url response failed: %w", err)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	text := string(bodyBytes)
+	if strings.Contains(strings.ToLower(contentType), "html") || strings.Contains(strings.ToLower(text), "<html") {
+		text = extractTextFromHTML(text)
+	} else {
+		text = normalizeWhitespaceLines(text)
+	}
+	text = truncateByRuneCount(text, maxToolResultChars)
+
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("fetch url non-2xx: status=%d, content_type=%s, body=%s", resp.StatusCode, contentType, text)
+	}
+
+	log.Printf("tool_fetch_url_success url=%s status=%d content_type=%s body_bytes=%d cleaned_chars=%d", u.String(), resp.StatusCode, contentType, len(bodyBytes), len(text))
+	return fmt.Sprintf("URL: %s\nStatus: %d\nContent-Type: %s\nContent:\n%s", u.String(), resp.StatusCode, contentType, text), nil
+}
+
+var (
+	reScriptTag = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+	reStyleTag  = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+	reHTMLTag   = regexp.MustCompile(`(?s)<[^>]+>`)
+)
+
+func extractTextFromHTML(raw string) string {
+	s := reScriptTag.ReplaceAllString(raw, " ")
+	s = reStyleTag.ReplaceAllString(s, " ")
+	s = reHTMLTag.ReplaceAllString(s, "\n")
+	s = html.UnescapeString(s)
+	return normalizeWhitespaceLines(s)
+}
+
+func normalizeWhitespaceLines(raw string) string {
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
 			continue
 		}
-		normalized = append(normalized, paragraph)
+		out = append(out, strings.Join(fields, " "))
 	}
-	if len(normalized) == 0 {
-		normalized = [][]feishuPostTag{{{Tag: "text", Text: "No content."}}}
+	return strings.Join(out, "\n")
+}
+
+func truncateByRuneCount(text string, max int) string {
+	if max <= 0 {
+		return ""
 	}
-	locale.Content = normalized
+	rs := []rune(text)
+	if len(rs) <= max {
+		return text
+	}
+	return string(rs[:max]) + "\n...(truncated)"
+}
+
+func getEnvAsInt(key string, defaultVal int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return defaultVal
+	}
+	return n
+}
+
+func summarizeForLog(raw string, maxRunes int) string {
+	normalized := strings.ReplaceAll(raw, "\n", "\\n")
+	normalized = strings.TrimSpace(normalized)
+	if maxRunes <= 0 {
+		return ""
+	}
+	rs := []rune(normalized)
+	if len(rs) <= maxRunes {
+		return normalized
+	}
+	return string(rs[:maxRunes]) + "...(truncated)"
 }
 
 type chatCompletionReq struct {
 	Model       string                  `json:"model"`
 	Messages    []chatCompletionMessage `json:"messages"`
 	Temperature float64                 `json:"temperature,omitempty"`
+	Tools       []chatTool              `json:"tools,omitempty"`
 }
 
 type chatCompletionMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string                   `json:"role"`
+	Content    any                      `json:"content,omitempty"`
+	ToolCallID string                   `json:"tool_call_id,omitempty"`
+	ToolCalls  []chatCompletionToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatCompletionResp struct {
@@ -428,7 +486,32 @@ type chatCompletionResp struct {
 }
 
 type chatCompletionChoice struct {
-	Message struct {
-		Content json.RawMessage `json:"content"`
-	} `json:"message"`
+	Message chatCompletionResponseMessage `json:"message"`
+}
+
+type chatCompletionResponseMessage struct {
+	Content   json.RawMessage          `json:"content"`
+	ToolCalls []chatCompletionToolCall `json:"tool_calls,omitempty"`
+}
+
+type chatCompletionToolCall struct {
+	ID       string                         `json:"id"`
+	Type     string                         `json:"type"`
+	Function chatCompletionToolCallFunction `json:"function"`
+}
+
+type chatCompletionToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type chatTool struct {
+	Type     string           `json:"type"`
+	Function chatToolFunction `json:"function"`
+}
+
+type chatToolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
 }
