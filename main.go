@@ -49,7 +49,7 @@ func main() {
 				answer = "Agent Error: " + err.Error()
 			}
 
-			content, err := buildTextContent(answer)
+			content, err := buildInteractiveContent(answer)
 			if err != nil {
 				return fmt.Errorf("build reply content failed: %w", err)
 			}
@@ -58,7 +58,7 @@ func main() {
 				larkim.NewReplyMessageReqBuilder().
 					MessageId(messageID).
 					Body(larkim.NewReplyMessageReqBodyBuilder().
-						MsgType("text").
+						MsgType("interactive").
 						Content(content).
 						Uuid("reply-"+messageID).
 						Build()).
@@ -107,8 +107,22 @@ func extractMessageID(event *larkim.P2MessageReceiveV1) string {
 	return *event.Event.Message.MessageId
 }
 
-func buildTextContent(text string) (string, error) {
-	payload := map[string]string{"text": text}
+func buildInteractiveContent(markdown string) (string, error) {
+	payload := map[string]any{
+		"config": map[string]any{
+			"wide_screen_mode": true,
+			"enable_forward":   true,
+		},
+		"elements": []map[string]any{
+			{
+				"tag": "div",
+				"text": map[string]string{
+					"tag":     "lark_md",
+					"content": markdown,
+				},
+			},
+		},
+	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
