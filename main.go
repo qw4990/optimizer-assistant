@@ -43,31 +43,17 @@ func main() {
 				question = "Please introduce your capabilities."
 			}
 
-			answer, err := agent.Answer(ctx, question)
+			content, err := agent.Answer(ctx, question)
 			if err != nil {
 				log.Printf("agent answer failed, message_id=%s, err=%v", messageID, err)
-				answer = "Agent Error: " + err.Error()
+				content, err = buildFeishuPostContentFromText(err.Error(), "Agent Error")
+				if err != nil {
+					return fmt.Errorf("build error reply content failed: %w", err)
+				}
 			}
 
-			content, err := buildInteractiveContent(answer)
-			if err != nil {
-				return fmt.Errorf("build reply content failed: %w", err)
-			}
-
-			resp, err := apiClient.Im.V1.Message.Reply(ctx,
-				larkim.NewReplyMessageReqBuilder().
-					MessageId(messageID).
-					Body(larkim.NewReplyMessageReqBodyBuilder().
-						MsgType("interactive").
-						Content(content).
-						Uuid("reply-"+messageID).
-						Build()).
-					Build())
-			if err != nil {
-				return fmt.Errorf("call reply api failed: %w", err)
-			}
-			if !resp.Success() {
-				return fmt.Errorf("reply api failed, code=%d, msg=%s", resp.Code, resp.Msg)
+			if err := replyPostMessage(ctx, apiClient, messageID, content); err != nil {
+				return err
 			}
 
 			return nil
@@ -107,29 +93,6 @@ func extractMessageID(event *larkim.P2MessageReceiveV1) string {
 	return *event.Event.Message.MessageId
 }
 
-func buildInteractiveContent(markdown string) (string, error) {
-	payload := map[string]any{
-		"config": map[string]any{
-			"wide_screen_mode": true,
-			"enable_forward":   true,
-		},
-		"elements": []map[string]any{
-			{
-				"tag": "div",
-				"text": map[string]string{
-					"tag":     "lark_md",
-					"content": markdown,
-				},
-			},
-		},
-	}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
 func extractQuestion(event *larkim.P2MessageReceiveV1) string {
 	if event == nil || event.Event == nil || event.Event.Message == nil || event.Event.Message.Content == nil {
 		return ""
@@ -149,4 +112,67 @@ func extractQuestion(event *larkim.P2MessageReceiveV1) string {
 		}
 	}
 	return raw
+}
+
+func replyPostMessage(ctx context.Context, apiClient *lark.Client, messageID, content string) error {
+	candidates := []string{content}
+	if alternative, ok := togglePostContentWrapper(content); ok && alternative != content {
+		candidates = append(candidates, alternative)
+	}
+
+	var lastErr error
+	for i, candidate := range candidates {
+		resp, err := apiClient.Im.V1.Message.Reply(ctx,
+			larkim.NewReplyMessageReqBuilder().
+				MessageId(messageID).
+				Body(larkim.NewReplyMessageReqBodyBuilder().
+					MsgType("post").
+					Content(candidate).
+					Uuid("reply-"+messageID).
+					Build()).
+				Build())
+		if err != nil {
+			lastErr = fmt.Errorf("call reply api failed: %w", err)
+			continue
+		}
+		if resp.Success() {
+			if i > 0 {
+				log.Printf("reply succeeded after switching post content wrapper format, message_id=%s", messageID)
+			}
+			return nil
+		}
+		lastErr = fmt.Errorf("reply api failed, code=%d, msg=%s", resp.Code, resp.Msg)
+	}
+	return lastErr
+}
+
+func togglePostContentWrapper(content string) (string, bool) {
+	raw := strings.TrimSpace(content)
+	if raw == "" {
+		return "", false
+	}
+
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return "", false
+	}
+
+	if postRaw, ok := obj["post"]; ok {
+		return string(postRaw), true
+	}
+
+	_, hasZhCN := obj["zh_cn"]
+	_, hasEnUS := obj["en_us"]
+	_, hasJaJP := obj["ja_jp"]
+	if !hasZhCN && !hasEnUS && !hasJaJP {
+		return "", false
+	}
+
+	wrapped, err := json.Marshal(map[string]json.RawMessage{
+		"post": json.RawMessage(raw),
+	})
+	if err != nil {
+		return "", false
+	}
+	return string(wrapped), true
 }
